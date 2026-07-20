@@ -1,0 +1,2 @@
+- [Todoist -> Things migration](todoist-things-migration.md) — 2026-07-20 one-time migration; area/project mapping conventions
+- [Things repeat-rule schema](things-repeat-rule-schema.md) — decoded rrv4 recurrence format + wire field mapping for repeat support

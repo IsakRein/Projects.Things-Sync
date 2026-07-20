@@ -463,10 +463,12 @@ def test_created_checklist_item_emits_its_complete_set():
     assert set(item["p"]) == {"cd", "ix", "lt", "md", "sp", "ss", "ts", "tt", "xx"}
 
 
-def test_checklist_count_is_recorded_on_the_parent():
+def test_checklist_leaves_icc_alone():
+    """`icc` is repeat bookkeeping (instance creation count), not a checklist
+    count — the app's own creates keep it 0 regardless of checklist size."""
     _uuid, changes = sync.build_create_todo("parent", checklist=["a", "b", "c"])
     parent = [c for c in changes.values() if c["e"] == "Task6"][0]
-    assert parent["p"]["icc"] == 3
+    assert parent["p"]["icc"] == 0
 
 
 def test_new_items_are_placed_after_their_siblings():

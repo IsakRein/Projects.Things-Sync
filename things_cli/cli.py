@@ -537,6 +537,11 @@ def cmd_add(args: SimpleNamespace) -> int:
     state, client = cloud_state()
     try:
         project_id, area_id, heading_id = _container(state, args)
+        if args.deadline_early is not None:
+            if not args.repeat:
+                raise SyncError("--deadline-early only makes sense with --repeat")
+            if not str(args.deadline_early).isdigit():
+                raise SyncError("--deadline-early takes a number of days")
         uuid, changes = sync.build_create_todo(
             args.title,
             notes=args.notes,
@@ -552,6 +557,13 @@ def cmd_add(args: SimpleNamespace) -> int:
                 project_id=project_id, area_id=area_id, heading_id=heading_id
             ),
             today_index=state.next_today_index(),
+            repeat=args.repeat,
+            deadline_early=(
+                int(args.deadline_early) if args.deadline_early is not None else None
+            ),
+            reminder=(
+                sync.parse_reminder(args.reminder) if args.reminder else None
+            ),
         )
         if not _commit(state, client, changes, args):
             return 0
@@ -895,6 +907,20 @@ COMMANDS: list[Command] = [
             Flag("--heading", True, "file under heading (id)", "REF"),
             Flag("--checklist", True, "comma-separated checklist items", "ITEMS"),
             Flag("--evening", False, "put it in This Evening"),
+            Flag(
+                "--repeat", True,
+                "make it repeating: 'every|after [N] day|week|month|year "
+                "[on mon,fri | on the 15th | on the last day | on jul 31]'; "
+                "--when anchors the first occurrence",
+                "RULE",
+            ),
+            Flag(
+                "--deadline-early", True,
+                "with --repeat: each occurrence is a deadline and the todo "
+                "shows up N days early",
+                "N",
+            ),
+            Flag("--reminder", True, "reminder time, HH:MM", "TIME"),
             _DRY,
         ],
         [Arg("title", "todo title", variadic=True)],

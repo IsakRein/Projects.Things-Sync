@@ -71,7 +71,7 @@ Writes:
 
 | Command | What |
 |---|---|
-| `add <title>` | new todo (`--when`, `--deadline`, `--notes`, `--tags`, `--project`, `--area`, `--heading`, `--checklist`, `--evening`) |
+| `add <title>` | new todo (`--when`, `--deadline`, `--notes`, `--tags`, `--project`, `--area`, `--heading`, `--checklist`, `--evening`, `--repeat`, `--deadline-early`, `--reminder`) |
 | `add-project` / `add-area` | new containers |
 | `edit <id>` | change only the fields you pass |
 | `complete` / `cancel` / `reopen` `<id>` | status |
@@ -98,6 +98,28 @@ things edit a1b2c3d4 --project=       # move out of its project
 Omitting a flag leaves that field alone — passing it empty clears it. The
 two are genuinely different on the wire, so the distinction is preserved
 end to end.
+
+### Repeats
+
+`--repeat` makes the new todo repeating — something no other Things Cloud
+client can do (the rule format isn't documented anywhere; it was decoded
+from the app's own sync traffic):
+
+```bash
+things add "Water plants" --repeat "every 3 days"
+things add "Review finances" --repeat "every week on sunday" --reminder 18:00
+things add "Momsredovisning" --repeat "every 3 months on the 10th" --deadline-early 40
+things add "Trim toenails" --repeat "after 3 weeks"          # after completion
+things add "Rent" --repeat "every month on the last day"
+things add "Taxes" --repeat "every year on may 2"
+```
+
+`every ...` repeats on a schedule; `after ...` repeats N units after each
+completion. `--when` anchors the first occurrence (default today).
+`--deadline-early N` gives each occurrence a deadline on the rule's date
+with the todo appearing N days early. What gets written is only the hidden
+repeating *template*; your Things apps materialize the visible instances
+from it, exactly as if the repeat had been created in the app.
 
 ## As a library
 

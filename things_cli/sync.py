@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import zlib
 from datetime import date, datetime, timezone
@@ -790,19 +791,19 @@ def _base_props(title: str, now: float) -> dict[str, Any]:
         "dds": None,           # deadline suppression day
         "dl": [],              # deadline list metadata
         "do": 0,               # due-date offset
-        "icc": 0,              # instance/checklist count
+        "icc": 0,              # instance creation count (repeat bookkeeping)
         "icp": False,          # instance creation paused
-        "icsd": None,          # instance creation suppressed day
+        "icsd": None,          # instance creation start day
         "ix": 0,               # sort index in its container
         "lai": None,           # last alarm interaction
         "lt": False,           # leaves tombstone on delete
         "md": now,             # modification timestamp
         "nt": empty_note(),    # notes
         "pr": [],              # parent project
-        "rmd": None,           # reminder metadata
-        "rp": None,            # reminder payload
-        "rr": None,            # recurrence rule
-        "rt": [],              # recurrence template link
+        "rmd": None,           # repeater migration date (newer repeat engine)
+        "rp": None,            # repeater (newer repeat engine; we write `rr`)
+        "rr": None,            # recurrence rule (on the hidden template row)
+        "rt": [],              # instance -> repeating template link
         "sb": 0,               # evening bit
         "sp": None,            # stop (completion) timestamp
         "sr": None,            # scheduled day
@@ -877,6 +878,186 @@ def parse_day(s: str) -> date:
         raise SyncError(f"could not parse date {s!r} (expected YYYY-MM-DD)")
 
 
+# ---------- repeat rules ----------
+#
+# A repeating todo is ONE hidden template row: a normal todo whose `rr`
+# holds the rule below (plain JSON on the wire — the app converts it to
+# its local plist blob). Real clients materialize the visible instances
+# themselves (rows with `rt: [template]`) and maintain the template's
+# `icc`/`icsd` bookkeeping, so writing the template is all we do.
+# Decoded 2026-07-20 from Things.app's own local rules and wire commits;
+# no public SDK documents this.
+
+RR_NEVER = 64092211200  # "end" / "deadline from rule" sentinel (year 4001)
+
+RR_UNITS = {"day": 16, "week": 256, "month": 8, "year": 4}
+
+# Wire weekday numbering, confirmed against real rules (Jul 20 2026, a
+# Monday, appears as wd=1): Sunday=0, Monday=1 ... Saturday=6.
+RR_WEEKDAYS = {
+    "sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3,
+    "thursday": 4, "friday": 5, "saturday": 6,
+}
+
+
+def parse_reminder(s: str) -> int:
+    """'HH:MM' -> the wire `ato` value: seconds since midnight."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise SyncError(f"could not parse reminder {s!r} (expected HH:MM)")
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60
+
+
+def _weekday_number(name: str) -> int:
+    n = name.strip().lower()
+    for full, wd in RR_WEEKDAYS.items():
+        if full.startswith(n) and len(n) >= 3:
+            return wd
+    raise SyncError(f"unknown weekday {name!r}")
+
+
+_MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december"]
+
+
+def _month_number(name: str) -> int:
+    n = name.strip().lower()
+    for i, full in enumerate(_MONTHS):
+        if full.startswith(n) and len(n) >= 3:
+            return i + 1
+    raise SyncError(f"unknown month {name!r}")
+
+
+def _last_dom(year: int, month: int) -> int:
+    import calendar
+
+    return calendar.monthrange(year, month)[1]
+
+
+def _next_weekly(base: date, wds: list[int]) -> date:
+    from datetime import timedelta
+
+    for i in range(8):
+        d = base + timedelta(days=i)
+        if d.isoweekday() % 7 in wds:
+            return d
+    raise SyncError("unreachable weekday")
+
+
+def _next_monthly(base: date, dom: int) -> date:
+    """Next date >= base whose day-of-month matches (dom=-1 is last day)."""
+    y, m = base.year, base.month
+    for _ in range(24):
+        day = _last_dom(y, m) if dom == -1 else dom
+        if day <= _last_dom(y, m):
+            d = date(y, m, day)
+            if d >= base:
+                return d
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    raise SyncError(f"no month has day {dom}")
+
+
+def _next_yearly(base: date, month: int, dom: int) -> date:
+    for y in (base.year, base.year + 1):
+        d = date(y, month, min(dom, _last_dom(y, month)))
+        if d >= base:
+            return d
+    raise SyncError("unreachable year")
+
+
+def parse_repeat(phrase: str, base: date) -> tuple[dict[str, Any], date]:
+    """Parse a repeat phrase into ``(rule-core, first-occurrence >= base)``.
+
+    Grammar: ``every|after [N] day|week|month|year [on SPEC]`` where SPEC is
+    weekdays (``on mon,fri``), a day of month (``on the 15th``, ``on the
+    last day``), or a yearly date (``on jul 31``). ``after`` makes it
+    repeat after completion instead of on a schedule.
+    """
+    m = re.fullmatch(
+        r"\s*(every|after)\s+(?:(\d+)\s+)?(day|week|month|year)s?"
+        r"(?:\s+on\s+(?:the\s+)?(.+?))?\s*",
+        phrase.lower(),
+    )
+    if not m:
+        raise SyncError(
+            f"could not parse repeat {phrase!r} "
+            "(expected 'every|after [N] day|week|month|year [on ...]')"
+        )
+    mode, count, unit, spec = m.groups()
+    tp = 1 if mode == "after" else 0
+    fa = int(count) if count else 1
+    fu = RR_UNITS[unit]
+
+    if unit == "day":
+        if spec:
+            raise SyncError("daily repeats take no 'on ...' part")
+        return {"fa": fa, "fu": fu, "of": [{"dy": 0}], "tp": tp}, base
+
+    if unit == "week":
+        if spec:
+            wds = [_weekday_number(p) for p in re.split(r"\s*(?:,|and)\s*", spec) if p]
+        else:
+            wds = [base.isoweekday() % 7]
+        first = _next_weekly(base, wds)
+        return {"fa": fa, "fu": fu, "of": [{"wd": w} for w in wds], "tp": tp}, first
+
+    if unit == "month":
+        if spec in (None, "", "last", "last day"):
+            dom = -1 if spec else base.day
+        else:
+            dm = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)?(?:\s+day)?", spec)
+            if not dm or not 1 <= int(dm.group(1)) <= 31:
+                raise SyncError(f"could not parse day of month {spec!r}")
+            dom = int(dm.group(1))
+        first = _next_monthly(base, dom)
+        return {"fa": fa, "fu": fu, "of": [{"dy": -1 if dom == -1 else dom - 1}], "tp": tp}, first
+
+    # yearly: "on jul 31" / "on 31 jul"; default = base's month/day
+    if spec:
+        ym = re.fullmatch(r"([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?", spec) or re.fullmatch(
+            r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)", spec
+        )
+        if not ym:
+            raise SyncError(f"could not parse yearly date {spec!r}")
+        a, b = ym.groups()
+        month, dom = (_month_number(a), int(b)) if a.isalpha() else (_month_number(b), int(a))
+    else:
+        month, dom = base.month, base.day
+    first = _next_yearly(base, month, dom)
+    return {"fa": fa, "fu": fu, "of": [{"dy": dom - 1, "mo": month - 1}], "tp": tp}, first
+
+
+def build_repeat_rule(
+    phrase: str, base: date, *, deadline_early: int | None = None
+) -> tuple[dict[str, Any], date]:
+    """Full ``rr`` payload plus the day the todo first becomes visible.
+
+    With ``deadline_early`` the rule's anchor date IS each occurrence's
+    deadline and the todo starts showing that many days earlier (`ts`) —
+    matching what the app writes for "repeat with deadline".
+    """
+    from datetime import timedelta
+
+    core, first = parse_repeat(phrase, base)
+    ts_off = -int(deadline_early) if deadline_early else 0
+    show = first + timedelta(days=ts_off)
+    rule = {
+        "ed": RR_NEVER,
+        "fa": core["fa"],
+        "fu": core["fu"],
+        "ia": float(day_ts(first)),
+        "of": core["of"],
+        "rc": 0,
+        "rrv": 4,
+        "sr": float(day_ts(show)),
+        "tp": core["tp"],
+        "ts": ts_off,
+    }
+    return rule, show
+
+
 def build_create_todo(
     title: str,
     *,
@@ -891,12 +1072,22 @@ def build_create_todo(
     evening: bool = False,
     index: int = 0,
     today_index: int = 0,
+    repeat: str | None = None,
+    deadline_early: int | None = None,
+    reminder: int | None = None,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """Build the changes map for a new todo (plus any checklist items).
 
     ``index`` / ``today_index`` place the item among its siblings; get them
     from :meth:`State.next_todo_index` / :meth:`State.next_today_index` so
     every new item doesn't collide at position 0.
+
+    With ``repeat`` the row is a hidden repeating TEMPLATE (see the repeat
+    rules section): ``when`` anchors the first occurrence (default today),
+    ``deadline_early`` gives each occurrence a deadline with the todo
+    showing that many days earlier, and any client that syncs will
+    materialize the visible instances. ``reminder`` is `ato` seconds from
+    :func:`parse_reminder`.
 
     Returns ``(todo_uuid, changes)``.
     """
@@ -916,17 +1107,43 @@ def build_create_todo(
     if project_id or heading_id or area_id:
         props["st"] = StartBucket.ANYTIME.value
 
-    apply_when(props, when, evening=evening)
-    if deadline:
-        props["dd"] = day_ts(parse_day(deadline))
+    if repeat:
+        if deadline:
+            raise SyncError(
+                "--deadline conflicts with --repeat; use --deadline-early "
+                "(each occurrence's deadline comes from the rule)"
+            )
+        if evening or (when or "").strip().lower() in ("anytime", "someday", "evening"):
+            raise SyncError("a repeat anchors on a date; use --when with a day")
+        base = parse_day(when) if when else today()
+        rule, show = build_repeat_rule(repeat, base, deadline_early=deadline_early)
+        # Shape observed on the app's own templates: scheduled-state with
+        # no `sr`/`tir` of its own (instances carry those), rule + start
+        # bookkeeping, and the deadline sentinel when the rule drives it.
+        props["st"] = StartBucket.SOMEDAY.value
+        props["sr"] = None
+        props["tir"] = None
+        props["ti"] = 0
+        props["rr"] = rule
+        props["icsd"] = day_ts(show)
+        if deadline_early is not None:
+            props["dd"] = RR_NEVER
+    else:
+        apply_when(props, when, evening=evening)
+        if deadline:
+            props["dd"] = day_ts(parse_day(deadline))
+
+    if reminder is not None:
+        props["ato"] = int(reminder)
     if notes:
         props["nt"] = encode_notes(notes)
     if tag_ids:
         props["tg"] = [base58.validate(t) for t in tag_ids]
 
+    # NOTE: `icc` is instance-creation bookkeeping for repeats, not a
+    # checklist count — the app's own creates leave it 0 (an earlier
+    # reading of the reference SDKs conflated the two).
     items = list(checklist or [])
-    if items:
-        props["icc"] = len(items)
 
     changes: dict[str, dict[str, Any]] = {
         uuid: {"t": OP_CREATE, "e": ENTITY_TASK, "p": props}
