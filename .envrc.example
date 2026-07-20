@@ -1,0 +1,5 @@
+# Things Cloud credentials. Copy into ~/.envrc (untracked) and run
+# `direnv allow ~`, then `things auth` to exchange them for the account's
+# history key. The password is used once and never stored.
+export THINGS3_EMAIL=you@example.com
+export THINGS3_PASSWORD='…'

@@ -1,19 +1,16 @@
-"""`things` CLI — a self-contained interface to Things 3.
+"""`things` CLI — a self-contained interface to Things 3 via Things Cloud.
 
-Reads go straight to Things' SQLite database (fast, works with the app in
-the background); writes go through the Things URL scheme; deletes through
-AppleScript. See README for the architecture.
+Reads and writes talk straight to Cultured Code's sync backend, so nothing
+here needs the Things app installed or running — it works on any machine
+with the account credentials.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import sys
-import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date
 from types import SimpleNamespace
 from typing import Callable
 
@@ -22,16 +19,10 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from things_cli import applescript, urlscheme
-from things_cli.db import DBError, ThingsDB, default_db_path
-from things_cli.models import (
-    Project,
-    StartBucket,
-    Status,
-    Todo,
-    to_json_dict,
-)
-from things_cli.urlscheme import UrlError
+from things_cli import api, sync
+from things_cli.api import CloudError
+from things_cli.models import Project, StartBucket, Status, Todo, to_json_dict
+from things_cli.sync import UNSET, State, SyncError
 
 console = Console()
 err_console = Console(stderr=True)
@@ -70,17 +61,14 @@ class Command:
     args: list[Arg] = field(default_factory=list)
 
 
-def _error(msg: str) -> int:
-    err_console.print(f"[bold red]error:[/bold red] {msg}")
-    return 1
-
-
-def get_db() -> ThingsDB:
-    """Open the database or exit with a clear error."""
+def cloud_state() -> tuple[State, api.Client]:
+    """Pull current cloud state (the single source of truth), or exit with
+    a clear error."""
     try:
-        return ThingsDB()
-    except DBError as e:
-        raise SystemExit(_error(str(e)))
+        return sync.fetch_state()
+    except (CloudError, SyncError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        raise SystemExit(1)
 
 
 # ---------- rendering ----------
@@ -179,7 +167,9 @@ def projects_table(projects: list[Project], *, show_status: bool = False) -> Tab
     return table
 
 
-def _print_todos(todos: list[Todo], args: SimpleNamespace, *, show_status: bool = False) -> int:
+def _print_todos(
+    todos: list[Todo], args: SimpleNamespace, *, show_status: bool = False
+) -> int:
     if getattr(args, "json", False):
         print(json.dumps([to_json_dict(t) for t in todos], indent=2))
         return 0
@@ -190,107 +180,91 @@ def _print_todos(todos: list[Todo], args: SimpleNamespace, *, show_status: bool 
     return 0
 
 
-# ---------- reference resolution ----------
+# ---------- read commands ----------
 
 
-def _resolve_kind(db: ThingsDB, ref: str, kinds: tuple[str, ...]) -> tuple[str, str]:
-    """Resolve a UUID/prefix and require one of the given kinds."""
-    kind, uuid = db.resolve(ref)
-    if kind not in kinds:
-        raise DBError(f"{ref!r} is a {kind}, expected {' or '.join(kinds)}")
-    return kind, uuid
+def cmd_status(args: SimpleNamespace) -> int:
+    state, _client = cloud_state()
+    open_todos = [t for t in state.todos.values() if not t.trashed and t.status == Status.OPEN]
+    console.print("[bold]source:[/bold]   [dim]cloud.culturedcode.com[/dim]")
+    console.print(f"[bold]head:[/bold]     [dim]index {state.head_index}[/dim]")
+    console.print(
+        f"[bold]open:[/bold]     {len(open_todos)} todos "
+        f"[dim]({len(state.todos)} total)[/dim]"
+    )
+    console.print(
+        f"[bold]projects:[/bold] {len(state.open_projects())} open "
+        f"[dim]({len(state.projects)} total)[/dim]"
+    )
+    console.print(
+        f"[bold]areas:[/bold]    {len(state.areas)}   "
+        f"[bold]tags:[/bold] {len(state.tags)}"
+    )
+    today_items = state.today_list()
+    inbox_items = state.inbox()
+    line = Text("today:    ", style="bold")
+    line.append(f"{len(today_items)} scheduled", style="yellow" if today_items else "dim")
+    line.append(f"   inbox: {len(inbox_items)}", style="dim")
+    console.print(line)
+    return 0
 
 
-def _project_id_for(db: ThingsDB, ref: str) -> str:
-    """A project given by exact title, full UUID, or UUID prefix."""
-    p = db.project_by_name(ref)
-    if p is not None:
-        return p.id
-    return _resolve_kind(db, ref, ("project",))[1]
-
-
-def _area_id_for(db: ThingsDB, ref: str) -> str:
-    a = db.area_by_name(ref)
-    if a is not None:
-        return a.id
-    return _resolve_kind(db, ref, ("area",))[1]
-
-
-def _list_id_for(db: ThingsDB, ns: SimpleNamespace) -> str | None:
-    """--project / --area on add/update → a URL-scheme list-id."""
-    if getattr(ns, "project", None):
-        return _project_id_for(db, ns.project)
-    if getattr(ns, "area", None):
-        return _area_id_for(db, ns.area)
-    return None
-
-
-def _split_multi(v: str | None) -> list[str] | None:
-    """Split a comma-separated multi-value flag (--checklist, --todos)."""
-    if not v:
-        return None
-    return [p.strip() for p in v.split(",") if p.strip()]
-
-
-# ---------- list commands ----------
-
-
-def _list_cmd(fetch: Callable[[ThingsDB], list[Todo]], *, show_status: bool = False):
+def _list_cmd(fetch: Callable[[State], list[Todo]], *, show_status: bool = False):
     def run(args: SimpleNamespace) -> int:
-        try:
-            todos = fetch(get_db())
-        except DBError as e:
-            return _error(str(e))
-        return _print_todos(todos, args, show_status=show_status)
+        state, _client = cloud_state()
+        return _print_todos(fetch(state), args, show_status=show_status)
 
     return run
 
 
 def cmd_logbook(args: SimpleNamespace) -> int:
+    state, _client = cloud_state()
     try:
         limit = int(args.limit) if args.limit else 25
     except ValueError:
-        return _error("--limit must be an integer")
-    try:
-        todos = get_db().logbook(limit=limit)
-    except DBError as e:
-        return _error(str(e))
-    return _print_todos(todos, args, show_status=True)
+        err_console.print("[bold red]error:[/bold red] --limit must be an integer")
+        return 2
+    return _print_todos(state.logbook(limit=limit), args, show_status=True)
 
 
 def cmd_todos(args: SimpleNamespace) -> int:
-    db = get_db()
-    status: Status | None = Status.OPEN
-    if args.status:
-        if args.status == "all":
-            status = None
-        else:
-            try:
-                status = Status(args.status)
-            except ValueError:
-                return _error("--status must be open, completed, canceled, or all")
+    state, _client = cloud_state()
     try:
-        project_id = _project_id_for(db, args.project) if args.project else None
-        area_id = _area_id_for(db, args.area) if args.area else None
-        todos = db.todos(
-            status=status,
-            project_id=project_id,
-            area_id=area_id,
-            tag=args.tag,
-            query=args.search,
-        )
-    except DBError as e:
-        return _error(str(e))
-    return _print_todos(todos, args, show_status=status is None)
+        todos = list(state.todos.values())
+        if args.project:
+            todos = state.todos_in_project(
+                state.require(args.project, "project"), open_only=not args.all
+            )
+        elif args.area:
+            todos = state.todos_in_area(
+                state.require(args.area, "area"), open_only=not args.all
+            )
+        elif args.tag:
+            todos = state.todos_with_tag(args.tag)
+        else:
+            todos = [t for t in state.todos.values() if not t.trashed]
+            if not args.all:
+                todos = [t for t in todos if t.status == Status.OPEN]
+            todos.sort(key=lambda t: t.index)
+        if args.search:
+            q = args.search.lower()
+            todos = [t for t in todos if q in t.title.lower() or q in t.notes.lower()]
+    except SyncError as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    return _print_todos(todos, args, show_status=args.all)
 
 
 def cmd_projects(args: SimpleNamespace) -> int:
-    db = get_db()
+    state, _client = cloud_state()
     try:
-        area_id = _area_id_for(db, args.area) if args.area else None
-        projects = db.projects(area_id=area_id, status=None if args.all else Status.OPEN)
-    except DBError as e:
-        return _error(str(e))
+        projects = state.all_projects() if args.all else state.open_projects()
+        if args.area:
+            area_id = state.require(args.area, "area")
+            projects = [p for p in projects if p.area_id == area_id]
+    except SyncError as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
     if args.json:
         print(json.dumps([to_json_dict(p) for p in projects], indent=2))
         return 0
@@ -302,10 +276,8 @@ def cmd_projects(args: SimpleNamespace) -> int:
 
 
 def cmd_areas(args: SimpleNamespace) -> int:
-    try:
-        areas = get_db().areas()
-    except DBError as e:
-        return _error(str(e))
+    state, _client = cloud_state()
+    areas = sorted(state.areas.values(), key=lambda a: a.index)
     if args.json:
         print(json.dumps([to_json_dict(a) for a in areas], indent=2))
         return 0
@@ -315,51 +287,52 @@ def cmd_areas(args: SimpleNamespace) -> int:
     table = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=False)
     table.add_column("ID", style="dim", no_wrap=True)
     table.add_column("Area")
-    table.add_column("Tags", style="magenta")
+    table.add_column("Projects", justify="right", no_wrap=True)
+    table.add_column("Open", justify="right", no_wrap=True)
     for a in areas:
-        name = Text(a.title)
-        if not a.visible:
-            name.append("  hidden", style="dim")
-        table.add_row(a.id[:8], name, ", ".join(a.tags))
+        projects = [p for p in state.open_projects() if p.area_id == a.id]
+        todos = state.todos_in_area(a.id)
+        table.add_row(
+            a.id[:8],
+            Text(a.title),
+            str(len(projects)) if projects else "",
+            str(len(todos)) if todos else "",
+        )
     console.print(table)
     return 0
 
 
 def cmd_tags(args: SimpleNamespace) -> int:
-    try:
-        tags = get_db().tags()
-    except DBError as e:
-        return _error(str(e))
+    state, _client = cloud_state()
+    tags = sorted(state.tags.values(), key=lambda t: t.index)
     if args.json:
         print(json.dumps([to_json_dict(t) for t in tags], indent=2))
         return 0
     if not tags:
         console.print("[dim]no tags[/dim]")
         return 0
-    by_id = {t.id: t.title for t in tags}
     table = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=False)
     table.add_column("ID", style="dim", no_wrap=True)
     table.add_column("Tag")
     table.add_column("Shortcut", no_wrap=True)
     table.add_column("Parent", style="dim")
+    table.add_column("Used", justify="right", no_wrap=True)
     for t in tags:
-        table.add_row(t.id[:8], t.title, t.shortcut, by_id.get(t.parent_id or "", ""))
+        used = len(state.todos_with_tag(t.title))
+        table.add_row(
+            t.id[:8],
+            Text(t.title, style="magenta"),
+            t.shortcut,
+            state.tags[t.parent_id].title if t.parent_id in state.tags else "",
+            str(used) if used else "",
+        )
     console.print(table)
     return 0
 
 
 def cmd_search(args: SimpleNamespace) -> int:
-    db = get_db()
-    try:
-        todos = db.todos(status=None, query=args.query)
-        projects = [
-            p
-            for p in db.projects(status=None)
-            if args.query.lower() in p.title.lower()
-            or args.query.lower() in p.notes.lower()
-        ]
-    except DBError as e:
-        return _error(str(e))
+    state, _client = cloud_state()
+    todos, projects = state.search(args.query)
     if args.json:
         print(
             json.dumps(
@@ -389,19 +362,17 @@ def _detail(label: str, value) -> None:
         console.print(f"  [bold]{label}:[/bold] {value}")
 
 
-def _show_todo(db: ThingsDB, uuid: str, as_json: bool) -> int:
-    t = db.todo(uuid)
-    if t is None:
-        return _error(f"todo {uuid} not found")
-    checklist = db.checklist(uuid)
+def _show_todo(state: State, uuid: str, as_json: bool) -> int:
+    t = state.todos[uuid]
+    checklist = state.checklists.get(uuid, [])
     if as_json:
         d = to_json_dict(t)
         d["checklist"] = [to_json_dict(c) for c in checklist]
         print(json.dumps(d, indent=2))
         return 0
-    glyph = _STATUS_GLYPH.get(t.status, Text("?"))
-    header = Text.assemble(glyph, " ", (t.title or "(untitled)", "bold"))
-    console.print(header)
+    console.print(
+        Text.assemble(_STATUS_GLYPH.get(t.status, Text("?")), " ", (t.title or "(untitled)", "bold"))
+    )
     console.print(f"  [dim]{t.id}[/dim]")
     _detail("status", t.status.value + (" (trashed)" if t.trashed else ""))
     if t.when:
@@ -411,10 +382,12 @@ def _show_todo(db: ThingsDB, uuid: str, as_json: bool) -> int:
         _detail("when", "someday")
     elif t.start == StartBucket.INBOX:
         _detail("when", "inbox")
+    else:
+        _detail("when", "anytime")
     _detail("deadline", t.deadline.isoformat() if t.deadline else None)
-    _detail("project", f"{t.project_title} [dim]{(t.project_id or '')[:8]}[/dim]" if t.project_id else None)
+    _detail("project", t.project_title)
     _detail("heading", t.heading_title)
-    _detail("area", f"{t.area_title} [dim]{(t.area_id or '')[:8]}[/dim]" if t.area_id else None)
+    _detail("area", t.area_title)
     _detail("tags", ", ".join(t.tags))
     _detail("repeating", "yes" if t.repeating else None)
     _detail("created", t.created.strftime("%Y-%m-%d %H:%M") if t.created else None)
@@ -427,23 +400,24 @@ def _show_todo(db: ThingsDB, uuid: str, as_json: bool) -> int:
         console.print()
         for c in checklist:
             mark = "[green]☑[/green]" if c.completed else "☐"
-            style = " dim" if c.completed else ""
-            console.print(f"  {mark} [{'default' + style}]{c.title}[/]")
+            style = "dim" if c.completed else ""
+            console.print(f"  {mark} [{style or 'default'}]{c.title}[/]")
     return 0
 
 
-def _show_project(db: ThingsDB, uuid: str, as_json: bool) -> int:
-    p = db.project(uuid)
-    if p is None:
-        return _error(f"project {uuid} not found")
-    todos = db.todos(status=None, project_id=uuid)
+def _show_project(state: State, uuid: str, as_json: bool) -> int:
+    p = state.projects[uuid]
+    todos = state.todos_in_project(uuid)
+    headings = state.project_headings(uuid)
     if as_json:
         d = to_json_dict(p)
+        d["headings"] = [to_json_dict(h) for h in headings]
         d["todos"] = [to_json_dict(t) for t in todos]
         print(json.dumps(d, indent=2))
         return 0
-    glyph = _STATUS_GLYPH.get(p.status, Text("?"))
-    console.print(Text.assemble(glyph, " ", (p.title or "(untitled)", "bold")))
+    console.print(
+        Text.assemble(_STATUS_GLYPH.get(p.status, Text("?")), " ", (p.title or "(untitled)", "bold"))
+    )
     console.print(f"  [dim]{p.id}[/dim]")
     _detail("status", p.status.value + (" (trashed)" if p.trashed else ""))
     _detail("area", p.area_title)
@@ -453,273 +427,293 @@ def _show_project(db: ThingsDB, uuid: str, as_json: bool) -> int:
         console.print()
         for line in p.notes.splitlines():
             console.print(f"  {line}")
-    if todos:
+    if headings:
+        console.print()
+        for h in headings:
+            under = [t for t in todos if t.heading_id == h.id]
+            console.print(f"  [bold]{h.title}[/bold] [dim]{h.id[:8]}[/dim]")
+            if under:
+                console.print(todos_table(under, show_status=True))
+        loose = [t for t in todos if not t.heading_id]
+        if loose:
+            console.print(todos_table(loose, show_status=True))
+    elif todos:
         console.print()
         console.print(todos_table(todos, show_status=True))
     return 0
 
 
 def cmd_show(args: SimpleNamespace) -> int:
-    db = get_db()
+    state, _client = cloud_state()
     try:
-        kind, uuid = db.resolve(args.id)
-    except DBError as e:
-        return _error(str(e))
+        kind, uuid = state.resolve(args.id)
+    except SyncError as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
     if kind == "todo":
-        return _show_todo(db, uuid, args.json)
+        return _show_todo(state, uuid, args.json)
     if kind == "project":
-        return _show_project(db, uuid, args.json)
+        return _show_project(state, uuid, args.json)
     if kind == "area":
-        a = db.area(uuid)
-        todos = db.todos(area_id=uuid)
-        projects = db.projects(area_id=uuid)
+        area = state.areas[uuid]
+        projects = [p for p in state.open_projects() if p.area_id == uuid]
+        todos = state.todos_in_area(uuid)
         if args.json:
-            d = to_json_dict(a)
+            d = to_json_dict(area)
             d["projects"] = [to_json_dict(p) for p in projects]
             d["todos"] = [to_json_dict(t) for t in todos]
             print(json.dumps(d, indent=2))
             return 0
-        console.print(Text(a.title, style="bold"))
-        console.print(f"  [dim]{a.id}[/dim]")
+        console.print(Text(area.title, style="bold"))
+        console.print(f"  [dim]{area.id}[/dim]")
         if projects:
             console.print(projects_table(projects))
         if todos:
             console.print(todos_table(todos))
         return 0
-    # tag
-    tag = next((t for t in db.tags() if t.id == uuid), None)
-    todos = db.todos(tag=tag.title) if tag else []
+    if kind == "tag":
+        tag = state.tags[uuid]
+        todos = state.todos_with_tag(tag.title)
+        if args.json:
+            d = to_json_dict(tag)
+            d["todos"] = [to_json_dict(t) for t in todos]
+            print(json.dumps(d, indent=2))
+            return 0
+        console.print(Text(tag.title, style="bold magenta"))
+        console.print(f"  [dim]{tag.id}[/dim]")
+        return _print_todos(todos, SimpleNamespace(json=False))
+    # heading
+    h = state.headings[uuid]
+    todos = [t for t in state.todos.values() if t.heading_id == uuid and not t.trashed]
     if args.json:
-        d = to_json_dict(tag)
+        d = to_json_dict(h)
         d["todos"] = [to_json_dict(t) for t in todos]
         print(json.dumps(d, indent=2))
         return 0
-    console.print(Text(tag.title, style="bold magenta"))
-    console.print(f"  [dim]{tag.id}[/dim]")
-    return _print_todos(todos, SimpleNamespace(json=False))
+    console.print(Text(h.title, style="bold"))
+    console.print(f"  [dim]{h.id}[/dim]  in {h.project_title or '?'}")
+    return _print_todos(sorted(todos, key=lambda t: t.index), SimpleNamespace(json=False))
 
 
 # ---------- write commands ----------
 
 
-def _fire(url: str, args: SimpleNamespace) -> bool:
-    """Open the URL unless --dry-run. Returns False (with a printed line)
-    on dry runs."""
+def _commit(
+    state: State, client: api.Client, changes: dict, args: SimpleNamespace
+) -> bool:
+    """Commit unless --dry-run. Returns False when nothing was sent."""
     if args.dry_run:
-        console.print(f"[dim]would open:[/dim] {url}")
+        console.print("[dim]would commit:[/dim]")
+        console.print_json(json.dumps(changes, default=str))
         return False
-    urlscheme.launch(url)
+    sync.commit(client, state, changes)
     return True
 
 
+def _tag_ids(state: State, raw: str | None) -> list[str] | None:
+    if not raw:
+        return None
+    return state.tag_ids_for(p.strip() for p in raw.split(",") if p.strip())
+
+
+def _checklist(raw: str | None) -> list[str] | None:
+    if not raw:
+        return None
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _container(state: State, args: SimpleNamespace) -> tuple[str | None, str | None, str | None]:
+    """Resolve --project / --area / --heading into ids."""
+    project_id = state.require(args.project, "project") if args.project else None
+    area_id = state.require(args.area, "area") if args.area else None
+    heading_id = state.require(args.heading, "heading") if args.heading else None
+    if heading_id and not project_id:
+        # A heading implies its project.
+        project_id = state.headings[heading_id].project_id
+    return project_id, area_id, heading_id
+
+
 def cmd_add(args: SimpleNamespace) -> int:
-    list_id = None
-    if args.project or args.area:
-        try:
-            list_id = _list_id_for(get_db(), args)
-        except DBError as e:
-            return _error(str(e))
-    url = urlscheme.build_add_url(
-        args.title,
-        notes=args.notes,
-        when=args.when,
-        deadline=args.deadline,
-        tags=args.tags,
-        checklist=_split_multi(args.checklist),
-        list_id=list_id,
-        heading=args.heading,
-        completed=args.completed,
-        reveal=args.reveal,
-    )
+    state, client = cloud_state()
     try:
-        started = datetime.now() - timedelta(seconds=5)
-        if not _fire(url, args):
+        project_id, area_id, heading_id = _container(state, args)
+        uuid, changes = sync.build_create_todo(
+            args.title,
+            notes=args.notes,
+            when=args.when,
+            deadline=args.deadline,
+            tag_ids=_tag_ids(state, args.tags),
+            project_id=project_id,
+            area_id=area_id,
+            heading_id=heading_id,
+            checklist=_checklist(args.checklist),
+            evening=args.evening,
+            index=state.next_todo_index(
+                project_id=project_id, area_id=area_id, heading_id=heading_id
+            ),
+            today_index=state.next_today_index(),
+        )
+        if not _commit(state, client, changes, args):
             return 0
-    except UrlError as e:
-        return _error(str(e))
+    except (SyncError, CloudError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
     line = Text.from_markup("[bold green]＋ added[/bold green] ")
     line.append(args.title)
-    created = _wait_for_created(args.title, started)
-    if created is not None:
-        line.append(f"  {created.id}", style="dim")
+    line.append(f"  {uuid[:8]}", style="dim")
     console.print(line)
     return 0
 
 
-def _wait_for_created(title: str, since: datetime) -> Todo | None:
-    """Best-effort UUID recovery: the URL scheme reports nothing back, so
-    poll the database briefly for the todo we just created."""
-    try:
-        db = ThingsDB()
-    except DBError:
-        return None
-    for _ in range(12):
-        try:
-            t = db.find_created_since(title, since)
-        except (DBError, Exception):
-            return None
-        if t is not None:
-            return t
-        time.sleep(0.25)
-    return None
-
-
 def cmd_add_project(args: SimpleNamespace) -> int:
-    area_id = None
-    if args.area:
-        try:
-            area_id = _area_id_for(get_db(), args.area)
-        except DBError as e:
-            return _error(str(e))
-    url = urlscheme.build_add_project_url(
-        args.title,
-        notes=args.notes,
-        when=args.when,
-        deadline=args.deadline,
-        tags=args.tags,
-        area_id=area_id,
-        todos=_split_multi(args.todos),
-        reveal=args.reveal,
-    )
+    state, client = cloud_state()
     try:
-        if not _fire(url, args):
-            return 0
-    except UrlError as e:
-        return _error(str(e))
-    console.print(Text.assemble(("＋ added project ", "bold green"), args.title))
-    return 0
-
-
-def _resolve_todo(args_id: str) -> tuple[ThingsDB, str, Todo | None]:
-    db = get_db()
-    _, uuid = _resolve_kind(db, args_id, ("todo",))
-    return db, uuid, db.todo(uuid)
-
-
-def cmd_update(args: SimpleNamespace) -> int:
-    try:
-        db, uuid, todo = _resolve_todo(args.id)
-        list_id = _list_id_for(db, args)
-        url = urlscheme.build_update_url(
-            uuid,
-            title=args.title,
-            notes=args.notes,
-            prepend_notes=args.prepend_notes,
-            append_notes=args.append_notes,
-            when=args.when,
-            deadline=args.deadline,
-            tags=args.tags,
-            add_tags=args.add_tags,
-            checklist=_split_multi(args.checklist),
-            append_checklist=_split_multi(args.append_checklist),
-            list_id=list_id,
-            heading=args.heading,
-        )
-        if not _fire(url, args):
-            return 0
-    except (DBError, UrlError) as e:
-        return _error(str(e))
-    name = args.title or (todo.title if todo else uuid[:8])
-    console.print(Text.assemble(("✎ updated ", "bold"), name))
-    return 0
-
-
-def cmd_update_project(args: SimpleNamespace) -> int:
-    try:
-        db = get_db()
-        _, uuid = _resolve_kind(db, args.id, ("project",))
-        proj = db.project(uuid)
-        area_id = _area_id_for(db, args.area) if args.area else None
-        url = urlscheme.build_update_url(
-            uuid,
-            project=True,
-            title=args.title,
+        area_id = state.require(args.area, "area") if args.area else None
+        uuid, changes = sync.build_create_project(
+            args.title,
             notes=args.notes,
             when=args.when,
             deadline=args.deadline,
-            tags=args.tags,
-            add_tags=args.add_tags,
+            tag_ids=_tag_ids(state, args.tags),
             area_id=area_id,
+            index=state.next_project_index(area_id),
         )
-        if not _fire(url, args):
+        if not _commit(state, client, changes, args):
             return 0
-    except (DBError, UrlError) as e:
-        return _error(str(e))
-    name = args.title or (proj.title if proj else uuid[:8])
-    console.print(Text.assemble(("✎ updated project ", "bold"), name))
+    except (SyncError, CloudError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    line = Text.from_markup("[bold green]＋ added project[/bold green] ")
+    line.append(args.title)
+    line.append(f"  {uuid[:8]}", style="dim")
+    console.print(line)
     return 0
 
 
-def _status_change(args: SimpleNamespace, *, completed: bool | None, canceled: bool | None, head: str, style: str) -> int:
+def cmd_add_area(args: SimpleNamespace) -> int:
+    state, client = cloud_state()
     try:
-        db = get_db()
-        kind, uuid = _resolve_kind(db, args.id, ("todo", "project"))
-        item = db.todo(uuid) if kind == "todo" else db.project(uuid)
-        url = urlscheme.build_update_url(
-            uuid, project=kind == "project", completed=completed, canceled=canceled
+        uuid, changes = sync.build_create_area(
+            args.title, index=state.next_area_index()
         )
-        if not _fire(url, args):
+        if not _commit(state, client, changes, args):
             return 0
-    except (DBError, UrlError) as e:
-        return _error(str(e))
-    name = item.title if item else uuid[:8]
-    console.print(Text.assemble((head + " ", style), name))
+    except (SyncError, CloudError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    line = Text.from_markup("[bold green]＋ added area[/bold green] ")
+    line.append(args.title)
+    line.append(f"  {uuid[:8]}", style="dim")
+    console.print(line)
     return 0
 
 
-def cmd_complete(args: SimpleNamespace) -> int:
-    return _status_change(args, completed=True, canceled=None, head="✓ completed", style="bold green")
+def cmd_edit(args: SimpleNamespace) -> int:
+    """Only the fields you pass change; `--when=` / `--deadline=` clear."""
+    state, client = cloud_state()
+    try:
+        kind, uuid = state.resolve(args.id)
+        if kind not in ("todo", "project"):
+            raise SyncError(f"{args.id!r} is a {kind}; edit takes a todo or project")
+        project_id, area_id, heading_id = _container(state, args)
+        changes = sync.build_update(
+            uuid,
+            state.entity_of(uuid),
+            title=args.title if args.title is not None else UNSET,
+            notes=args.notes if args.notes is not None else UNSET,
+            when=(args.when or None) if args.when is not None else UNSET,
+            deadline=(args.deadline or None) if args.deadline is not None else UNSET,
+            tag_ids=_tag_ids(state, args.tags) if args.tags is not None else UNSET,
+            project_id=project_id if args.project is not None else UNSET,
+            area_id=area_id if args.area is not None else UNSET,
+            heading_id=heading_id if args.heading is not None else UNSET,
+            evening=True if args.evening else UNSET,
+        )
+        if len(changes[uuid]["p"]) <= 1:  # only the md stamp
+            err_console.print(
+                "[bold red]error:[/bold red] nothing to change "
+                "(pass --title/--notes/--when/--deadline/--tags/--project/--area)"
+            )
+            return 2
+        name = args.title or state.title_of(uuid)
+        if not _commit(state, client, changes, args):
+            return 0
+    except (SyncError, CloudError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    console.print(Text.assemble(("✎ edited ", "bold"), name))
+    return 0
 
 
-def cmd_cancel(args: SimpleNamespace) -> int:
-    return _status_change(args, completed=None, canceled=True, head="✗ canceled", style="bold red")
+def _status_cmd(status: Status, head: str, style: str):
+    def run(args: SimpleNamespace) -> int:
+        state, client = cloud_state()
+        try:
+            kind, uuid = state.resolve(args.id)
+            if kind not in ("todo", "project"):
+                raise SyncError(f"{args.id!r} is a {kind}; expected a todo or project")
+            name = state.title_of(uuid)
+            changes = sync.build_update(uuid, state.entity_of(uuid), status=status)
+            if not _commit(state, client, changes, args):
+                return 0
+        except (SyncError, CloudError) as e:
+            err_console.print(f"[bold red]error:[/bold red] {e}")
+            return 1
+        console.print(Text.assemble((head + " ", style), name))
+        return 0
 
-
-def cmd_reopen(args: SimpleNamespace) -> int:
-    return _status_change(args, completed=False, canceled=None, head="↺ reopened", style="bold")
+    return run
 
 
 def cmd_delete(args: SimpleNamespace) -> int:
+    state, client = cloud_state()
     try:
-        db = get_db()
-        kind, uuid = _resolve_kind(db, args.id, ("todo", "project", "area", "tag"))
-        item = db.todo(uuid) if kind == "todo" else db.project(uuid) if kind == "project" else None
-        name = item.title if item else uuid[:8]
-    except DBError as e:
-        return _error(str(e))
+        kind, uuid = state.resolve(args.id)
+        name = state.title_of(uuid)
+    except SyncError as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    # Only todos and projects carry a `tr` flag, so only they can be
+    # trashed; areas and tags have no Trash in Things and must go outright.
+    trashable = kind in ("todo", "project")
+    permanent = args.permanent or not trashable
+
     preview = args.dry_run or not args.yes
-    if preview:
-        console.print(Text.assemble(("would delete ", "dim"), f"{kind} ", name))
-        if not args.dry_run:
-            console.print("[dim]pass --yes to actually delete[/dim]")
+    if preview and not args.dry_run:
+        verb = "permanently delete" if permanent else "move to Trash"
+        console.print(Text.assemble((f"would {verb} ", "dim"), f"{kind} ", name))
+        console.print("[dim]pass --yes to confirm[/dim]")
         return 0
+
+    targets = [(uuid, state.entity_of(uuid))]
     try:
-        applescript.delete(kind, uuid)
-    except applescript.ScriptError as e:
-        return _error(str(e))
-    tail = " → Trash" if kind in ("todo", "project") else ""
-    console.print(Text.assemble(("🗑 deleted ", "bold red"), f"{kind} ", name, (tail, "dim")))
-    return 0
+        if permanent:
+            # Nothing cascades server-side, so a todo's checklist items must
+            # go in the same commit or they are stranded forever.
+            if kind == "todo":
+                targets += [
+                    (c.id, state.entity_of(c.id))
+                    for c in state.checklists.get(uuid, [])
+                ]
+            changes = sync.build_delete_many(targets)
+        else:
+            changes = sync.build_update(uuid, state.entity_of(uuid), trashed=True)
+        if not _commit(state, client, changes, args):
+            return 0
+    except (SyncError, CloudError) as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
 
-
-def cmd_empty_trash(args: SimpleNamespace) -> int:
-    if not args.yes:
-        console.print("[dim]would empty the Things Trash — pass --yes to confirm[/dim]")
-        return 0
-    try:
-        applescript.empty_trash()
-    except applescript.ScriptError as e:
-        return _error(str(e))
-    console.print("[bold red]🗑 emptied trash[/bold red]")
-    return 0
-
-
-def cmd_open(args: SimpleNamespace) -> int:
-    try:
-        _, uuid = get_db().resolve(args.id)
-        urlscheme.launch(urlscheme.build_show_url(uuid), foreground=True)
-    except (DBError, UrlError) as e:
-        return _error(str(e))
+    if permanent:
+        line = Text.assemble(("🗑 deleted ", "bold red"), f"{kind} ", name)
+        if len(targets) > 1:
+            line.append(f"  (+{len(targets) - 1} checklist items)", style="dim")
+        if not trashable and not args.permanent:
+            line.append("  (this type has no Trash)", style="dim")
+    else:
+        line = Text.assemble(("🗑 trashed ", "bold red"), f"{kind} ", name)
+        line.append("  (recoverable in Things)", style="dim")
+    console.print(line)
     return 0
 
 
@@ -727,18 +721,26 @@ def cmd_open(args: SimpleNamespace) -> int:
 
 
 def cmd_auth(args: SimpleNamespace) -> int:
-    tok = urlscheme.auth_token()
-    if tok:
-        console.print(f"[bold green]✓[/bold green] {urlscheme.ENV_TOKEN} is set [dim](…{tok[-4:]})[/dim]")
-        return 0
-    console.print(f"[bold red]✗[/bold red] {urlscheme.ENV_TOKEN} is not set")
-    console.print()
-    console.print("Updates via the Things URL scheme need Things' auth token:")
-    console.print("  1. Open Things → Settings → General → Enable Things URLs")
-    console.print("  2. Manage → copy the token")
-    console.print(f"  3. Add to ~/.envrc:  export {urlscheme.ENV_TOKEN}=<token>")
-    console.print("  4. direnv allow ~")
-    return 1
+    """Fetch and save the account's history key to ~/.config/things-cli."""
+    creds = api.env_credentials()
+    if creds is None:
+        err_console.print(
+            f"[bold red]error:[/bold red] set {api.ENV_EMAIL} and "
+            f"{api.ENV_PASSWORD} (e.g. in ~/.envrc, then `direnv allow ~`)"
+        )
+        return 1
+    email, password = creds
+    try:
+        key = api.fetch_history_key(email, password)
+    except CloudError as e:
+        err_console.print(f"[bold red]error:[/bold red] {e}")
+        return 1
+    path = api.save_session(api.Session(email=email, history_key=key))
+    sync.clear_cache()
+    console.print(f"[bold green]✓ saved session[/bold green] [dim]for {email}[/dim]")
+    console.print(f"  [dim]→ {path}[/dim]")
+    console.print(f"  [dim]history[/dim] {key[:8]}…")
+    return 0
 
 
 def cmd_doctor(args: SimpleNamespace) -> int:
@@ -755,33 +757,48 @@ def cmd_doctor(args: SimpleNamespace) -> int:
 
     console.print("[bold]things doctor[/bold]")
     console.print()
-    console.print("[bold underline]App[/bold underline]")
-    app = Path("/Applications/Things3.app")
-    check("Things 3 installed", app.exists(), str(app) if app.exists() else "not found in /Applications")
-    check("`open` available", shutil.which("open") is not None)
-    check("`osascript` available", shutil.which("osascript") is not None, "needed only for delete/empty-trash")
-
-    console.print()
-    console.print("[bold underline]Database (reads)[/bold underline]")
-    try:
-        db = ThingsDB()
-        counts = db.counts()
-        check(
-            "database readable",
-            True,
-            f"{db.path}  ({counts['open_todos']} open todos, {counts['projects']} projects)",
-        )
-    except (DBError, Exception) as e:
-        check("database readable", False, str(e))
-
-    console.print()
-    console.print("[bold underline]Auth (updates)[/bold underline]")
-    tok = urlscheme.auth_token()
+    console.print("[bold underline]Auth[/bold underline]")
+    session = api.load_session()
+    env = api.env_credentials()
+    if session is not None:
+        src = f"session file ({api.SESSION_PATH})"
+    elif env is not None:
+        src = f"env ({api.ENV_EMAIL} + {api.ENV_PASSWORD})"
+    else:
+        src = ""
     check(
-        f"{urlscheme.ENV_TOKEN} set",
-        tok is not None,
-        f"…{tok[-4:]}" if tok else "needed for update/complete/cancel — run `things auth`",
+        "credentials available",
+        session is not None or env is not None,
+        f"from {src}" if src else
+        f"set {api.ENV_EMAIL}/{api.ENV_PASSWORD} in ~/.envrc, then run `things auth`",
     )
+
+    console.print()
+    console.print("[bold underline]Cloud[/bold underline]")
+    if session is None and env is None:
+        console.print("  [yellow]⊘[/yellow] [dim]skipped — set up auth first[/dim]")
+    else:
+        try:
+            client = api.Client.connect()
+            status = client.history_status()
+            check(
+                "cloud.culturedcode.com reachable",
+                True,
+                f"latest-server-index={status.get('latest-server-index')}",
+            )
+            state, _ = sync.fetch_state(client)
+            check(
+                "history readable",
+                True,
+                f"{len(state.todos)} todos, {len(state.projects)} projects, "
+                f"{len(state.areas)} areas, {len(state.tags)} tags",
+            )
+        except (CloudError, SyncError) as e:
+            check("cloud.culturedcode.com reachable", False, str(e))
+
+    console.print()
+    console.print("[bold underline]Cache[/bold underline]")
+    console.print(f"  [dim]{sync.CACHE_PATH}[/dim]")
 
     console.print()
     if ok:
@@ -791,43 +808,50 @@ def cmd_doctor(args: SimpleNamespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_refresh(args: SimpleNamespace) -> int:
+    """Drop the local cache so the next command re-folds the whole history."""
+    sync.clear_cache()
+    console.print("[dim]cache cleared — next command does a full pull[/dim]")
+    return 0
+
+
 # ---------- command registry + hand-rolled parsing (rich-rendered help) ----------
 
 PROG = "things"
 DESCRIPTION = (
-    "A self-contained interface to Things 3 — reads from the app's database, "
-    "writes through the Things URL scheme."
+    "A self-contained interface to Things 3 — read and manage your tasks "
+    "via the Things Cloud backend (no app required)."
 )
 
 _JSON = Flag("--json", False, "emit JSON (uncolored)")
-_DRY = Flag("--dry-run", False, "print the Things URL without opening it")
-
-_WHEN_HELP = "today / tomorrow / evening / anytime / someday / yyyy-mm-dd"
+_DRY = Flag("--dry-run", False, "show the change without sending it")
+_WHEN = "today / evening / anytime / someday / tomorrow / yyyy-mm-dd"
 
 COMMANDS: list[Command] = [
-    Command("inbox", "List Inbox todos", _list_cmd(lambda db: db.inbox()), [_JSON]),
-    Command("today", "List Today (incl. overdue deadlines)", _list_cmd(lambda db: db.today()), [_JSON]),
-    Command("upcoming", "List Upcoming (scheduled ahead)", _list_cmd(lambda db: db.upcoming()), [_JSON]),
-    Command("anytime", "List Anytime", _list_cmd(lambda db: db.anytime()), [_JSON]),
-    Command("someday", "List Someday", _list_cmd(lambda db: db.someday()), [_JSON]),
+    Command("status", "Summary of the account + today's load", cmd_status),
+    Command("inbox", "List Inbox todos", _list_cmd(lambda s: s.inbox()), [_JSON]),
+    Command("today", "List Today", _list_cmd(lambda s: s.today_list()), [_JSON]),
+    Command("upcoming", "List Upcoming (scheduled ahead)", _list_cmd(lambda s: s.upcoming()), [_JSON]),
+    Command("anytime", "List Anytime", _list_cmd(lambda s: s.anytime()), [_JSON]),
+    Command("someday", "List Someday", _list_cmd(lambda s: s.someday()), [_JSON]),
     Command(
         "logbook",
         "List completed/canceled todos, newest first",
         cmd_logbook,
         [Flag("--limit", True, "max rows (default 25)", "N"), _JSON],
     ),
-    Command("trash", "List trashed todos", _list_cmd(lambda db: db.trash(), show_status=True), [_JSON]),
-    Command("deadlines", "List open todos with deadlines", _list_cmd(lambda db: db.deadlines()), [_JSON]),
+    Command("trash", "List trashed todos", _list_cmd(lambda s: s.trash(), show_status=True), [_JSON]),
+    Command("deadlines", "List open todos with deadlines", _list_cmd(lambda s: s.deadlines()), [_JSON]),
     Command(
         "todos",
         "List todos with filters",
         cmd_todos,
         [
-            Flag("--project", True, "filter by project title or id", "REF"),
-            Flag("--area", True, "filter by area title or id", "REF"),
+            Flag("--project", True, "filter by project (title or id)", "REF"),
+            Flag("--area", True, "filter by area (title or id)", "REF"),
             Flag("--tag", True, "filter by tag name", "NAME"),
-            Flag("--status", True, "open (default) / completed / canceled / all", "S"),
             Flag("--search", True, "title/notes substring", "TEXT"),
+            Flag("--all", False, "include completed/canceled"),
             _JSON,
         ],
     ),
@@ -836,7 +860,7 @@ COMMANDS: list[Command] = [
         "List projects",
         cmd_projects,
         [
-            Flag("--area", True, "filter by area title or id", "REF"),
+            Flag("--area", True, "filter by area (title or id)", "REF"),
             Flag("--all", False, "include completed/canceled"),
             _JSON,
         ],
@@ -845,10 +869,10 @@ COMMANDS: list[Command] = [
     Command("tags", "List tags", cmd_tags, [_JSON]),
     Command(
         "show",
-        "Show a todo/project/area/tag in detail",
+        "Show a todo/project/area/tag/heading in detail",
         cmd_show,
         [_JSON],
-        [Arg("id", "UUID or unique prefix (from any list's ID column)")],
+        [Arg("id", "id, unique id prefix, or exact title")],
     ),
     Command(
         "search",
@@ -862,16 +886,15 @@ COMMANDS: list[Command] = [
         "Add a todo",
         cmd_add,
         [
-            Flag("--notes", True, "notes text", "TEXT"),
-            Flag("--when", True, _WHEN_HELP, "WHEN"),
+            Flag("--when", True, _WHEN, "WHEN"),
             Flag("--deadline", True, "yyyy-mm-dd", "DATE"),
-            Flag("--tags", True, "comma-separated tag names", "TAGS"),
-            Flag("--checklist", True, "comma-separated checklist items", "ITEMS"),
+            Flag("--notes", True, "notes text", "TEXT"),
+            Flag("--tags", True, "comma-separated existing tag names", "TAGS"),
             Flag("--project", True, "file into project (title or id)", "REF"),
             Flag("--area", True, "file into area (title or id)", "REF"),
-            Flag("--heading", True, "heading title within the project", "NAME"),
-            Flag("--completed", False, "log it as already completed"),
-            Flag("--reveal", False, "show the new todo in Things"),
+            Flag("--heading", True, "file under heading (id)", "REF"),
+            Flag("--checklist", True, "comma-separated checklist items", "ITEMS"),
+            Flag("--evening", False, "put it in This Evening"),
             _DRY,
         ],
         [Arg("title", "todo title", variadic=True)],
@@ -881,77 +904,79 @@ COMMANDS: list[Command] = [
         "Add a project",
         cmd_add_project,
         [
-            Flag("--notes", True, "notes text", "TEXT"),
-            Flag("--when", True, _WHEN_HELP, "WHEN"),
+            Flag("--when", True, _WHEN, "WHEN"),
             Flag("--deadline", True, "yyyy-mm-dd", "DATE"),
-            Flag("--tags", True, "comma-separated tag names", "TAGS"),
+            Flag("--notes", True, "notes text", "TEXT"),
+            Flag("--tags", True, "comma-separated existing tag names", "TAGS"),
             Flag("--area", True, "file into area (title or id)", "REF"),
-            Flag("--todos", True, "comma-separated initial todos", "ITEMS"),
-            Flag("--reveal", False, "show the new project in Things"),
             _DRY,
         ],
         [Arg("title", "project title", variadic=True)],
     ),
     Command(
-        "update",
-        "Update a todo (needs auth token; empty --when= / --deadline= clears)",
-        cmd_update,
+        "add-area",
+        "Add an area",
+        cmd_add_area,
+        [_DRY],
+        [Arg("title", "area title", variadic=True)],
+    ),
+    Command(
+        "edit",
+        "Edit a todo/project by id (only the fields you pass change)",
+        cmd_edit,
         [
             Flag("--title", True, "new title", "TEXT"),
             Flag("--notes", True, "replace notes (--notes= clears)", "TEXT"),
-            Flag("--prepend-notes", True, "prepend to notes", "TEXT"),
-            Flag("--append-notes", True, "append to notes", "TEXT"),
-            Flag("--when", True, _WHEN_HELP + " (--when= clears)", "WHEN"),
+            Flag("--when", True, _WHEN + " (--when= clears)", "WHEN"),
             Flag("--deadline", True, "yyyy-mm-dd (--deadline= clears)", "DATE"),
             Flag("--tags", True, "replace tags (--tags= clears)", "TAGS"),
-            Flag("--add-tags", True, "add tags, keeping existing", "TAGS"),
-            Flag("--checklist", True, "replace checklist (comma-separated)", "ITEMS"),
-            Flag("--append-checklist", True, "append checklist items", "ITEMS"),
-            Flag("--project", True, "move into project (title or id)", "REF"),
-            Flag("--area", True, "move into area (title or id)", "REF"),
-            Flag("--heading", True, "move under heading (title)", "NAME"),
+            Flag("--project", True, "move into project (--project= clears)", "REF"),
+            Flag("--area", True, "move into area (--area= clears)", "REF"),
+            Flag("--heading", True, "move under heading (--heading= clears)", "REF"),
+            Flag("--evening", False, "move to This Evening"),
             _DRY,
         ],
-        [Arg("id", "todo UUID or unique prefix")],
+        [Arg("id", "id or unique id prefix")],
     ),
     Command(
-        "update-project",
-        "Update a project (needs auth token)",
-        cmd_update_project,
-        [
-            Flag("--title", True, "new title", "TEXT"),
-            Flag("--notes", True, "replace notes", "TEXT"),
-            Flag("--when", True, _WHEN_HELP, "WHEN"),
-            Flag("--deadline", True, "yyyy-mm-dd (--deadline= clears)", "DATE"),
-            Flag("--tags", True, "replace tags", "TAGS"),
-            Flag("--add-tags", True, "add tags, keeping existing", "TAGS"),
-            Flag("--area", True, "move into area (title or id)", "REF"),
-            _DRY,
-        ],
-        [Arg("id", "project UUID or unique prefix")],
+        "complete",
+        "Mark a todo/project completed",
+        _status_cmd(Status.COMPLETED, "✓ completed", "bold green"),
+        [_DRY],
+        [Arg("id", "id or unique id prefix")],
     ),
-    Command("complete", "Mark a todo/project completed", cmd_complete, [_DRY], [Arg("id", "UUID or unique prefix")]),
-    Command("cancel", "Mark a todo/project canceled", cmd_cancel, [_DRY], [Arg("id", "UUID or unique prefix")]),
-    Command("reopen", "Reopen a completed/canceled todo/project", cmd_reopen, [_DRY], [Arg("id", "UUID or unique prefix")]),
+    Command(
+        "cancel",
+        "Mark a todo/project canceled",
+        _status_cmd(Status.CANCELED, "✗ canceled", "bold red"),
+        [_DRY],
+        [Arg("id", "id or unique id prefix")],
+    ),
+    Command(
+        "reopen",
+        "Reopen a completed/canceled todo/project",
+        _status_cmd(Status.OPEN, "↺ reopened", "bold"),
+        [_DRY],
+        [Arg("id", "id or unique id prefix")],
+    ),
     Command(
         "delete",
-        "Delete a todo/project/area/tag (todos/projects → Trash)",
+        "Move a todo/project to Trash (areas/tags are removed outright)",
         cmd_delete,
         [
             Flag("--yes", False, "confirm — required to actually delete"),
+            Flag("--permanent", False, "destroy instead of trashing (no undo)"),
             Flag("--dry-run", False, "preview only (same as omitting --yes)"),
         ],
-        [Arg("id", "UUID or unique prefix")],
+        [Arg("id", "id or unique id prefix")],
     ),
     Command(
-        "empty-trash",
-        "Purge everything in the Things Trash",
-        cmd_empty_trash,
-        [Flag("--yes", False, "confirm — required to actually purge")],
+        "auth",
+        "Fetch and save the Things Cloud session (from env credentials)",
+        cmd_auth,
     ),
-    Command("open", "Reveal an item in the Things app", cmd_open, [], [Arg("id", "UUID or unique prefix")]),
-    Command("auth", "Check the URL-scheme auth token + setup steps", cmd_auth),
-    Command("doctor", "Verify app, database access, and auth token", cmd_doctor),
+    Command("doctor", "Verify credentials, cloud reachability, and the history", cmd_doctor),
+    Command("refresh", "Clear the local cache (forces a full re-pull)", cmd_refresh),
 ]
 COMMANDS_BY_NAME = {c.name: c for c in COMMANDS}
 
@@ -961,6 +986,8 @@ def _flag_label(f: Flag) -> str:
 
 
 def _arg_token(a: Arg) -> str:
+    """Plain label, e.g. '<id>' or '[title…]'. Not markup-safe — wrap in
+    Text (table cells) or escape the leading bracket (markup strings)."""
     tok = f"{a.name}…" if a.variadic else a.name
     return f"<{tok}>" if a.required else f"[{tok}]"
 

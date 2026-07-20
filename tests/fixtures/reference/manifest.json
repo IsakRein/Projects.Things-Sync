@@ -1,0 +1,99 @@
+[
+  {
+    "name": "inbox__basic_list",
+    "method": "inbox",
+    "today_ts": null,
+    "titles": [
+      "Buy oat milk",
+      "Email landlord"
+    ]
+  },
+  {
+    "name": "inbox__empty",
+    "method": "inbox",
+    "today_ts": null,
+    "titles": []
+  },
+  {
+    "name": "inbox__ignores_project_and_area_scoped_tasks",
+    "method": "inbox",
+    "today_ts": null,
+    "titles": [
+      "Top-level inbox task"
+    ]
+  },
+  {
+    "name": "today__basic_list",
+    "method": "today_list",
+    "today_ts": 1774396800,
+    "titles": [
+      "Morning workout",
+      "Read email"
+    ]
+  },
+  {
+    "name": "today__empty",
+    "method": "today_list",
+    "today_ts": 1774396800,
+    "titles": []
+  },
+  {
+    "name": "today__evening_section_split",
+    "method": "today_list",
+    "today_ts": 1774396800,
+    "titles": [
+      "Plan day",
+      "Review finances"
+    ]
+  },
+  {
+    "name": "today__no_args_defaults_to_today",
+    "method": "today_list",
+    "today_ts": 1774396800,
+    "titles": []
+  },
+  {
+    "name": "today__respects_null_patch_clearing_schedule_fields",
+    "method": "today_list",
+    "today_ts": 1774396800,
+    "titles": [
+      "Still in today"
+    ]
+  },
+  {
+    "name": "anytime__empty",
+    "method": "anytime",
+    "today_ts": 1774396800,
+    "titles": []
+  },
+  {
+    "name": "anytime__filters_someday_future_trashed_and_completed",
+    "method": "anytime",
+    "today_ts": 1774396800,
+    "titles": [
+      "Visible anytime task"
+    ]
+  },
+  {
+    "name": "someday__empty",
+    "method": "someday",
+    "today_ts": null,
+    "titles": []
+  },
+  {
+    "name": "upcoming__basic_grouped_by_future_date",
+    "method": "upcoming",
+    "today_ts": 1774396800,
+    "titles": [
+      "Prepare quarterly plan",
+      "Send kickoff email",
+      "Book team retro"
+    ]
+  },
+  {
+    "name": "upcoming__empty",
+    "method": "upcoming",
+    "today_ts": 1774396800,
+    "titles": []
+  }
+]

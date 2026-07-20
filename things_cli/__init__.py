@@ -1,10 +1,16 @@
-"""things-cli — a self-contained CLI for Things 3.
+"""things-cli — a self-contained interface to Things 3 via Things Cloud.
 
-Reads come straight from Things' SQLite database; writes go through the
-Things URL scheme (deletes through AppleScript).
+Reads and writes go straight to Cultured Code's sync backend, so nothing
+requires the Things app to be installed or running.
+
+    from things_cli import fetch_state
+
+    state, client = fetch_state()
+    for todo in state.today_list():
+        print(todo.title)
 """
 
-from .db import ThingsDB, DBError
+from .api import Client, CloudError, Session
 from .models import (
     Area,
     ChecklistItem,
@@ -15,10 +21,15 @@ from .models import (
     Tag,
     Todo,
 )
+from .sync import State, SyncError, fetch_state
 
 __all__ = [
-    "ThingsDB",
-    "DBError",
+    "Client",
+    "CloudError",
+    "Session",
+    "State",
+    "SyncError",
+    "fetch_state",
     "Area",
     "ChecklistItem",
     "Heading",
