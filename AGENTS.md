@@ -1,7 +1,7 @@
 CLI + Python library for Things 3, over the Things Cloud sync API. No local
 Things app needed — it works headless (including on the mini).
 
-Install with `uv tool install "git+https://github.com/IsakRein/Projects.Things-Sync"`.
+Install with `uv tool install "git+https://github.com/IsakRein/Productivity.Things-Sync"`.
 
 Credentials live in `~/.envrc` as `THINGS3_EMAIL` / `THINGS3_PASSWORD`;
 `things auth` exchanges them once for the account's history key, cached in

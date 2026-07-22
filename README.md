@@ -5,7 +5,7 @@ Code's private **Things Cloud** sync backend. No Things app required —
 reads and writes work from any machine with the account credentials,
 including headless ones (the Mac mini).
 
-Same shape as [`tt`](https://github.com/IsakRein/Projects.Timelines-Sync):
+Same shape as [`tt`](https://github.com/IsakRein/Productivity.Timelines-Sync):
 a `Client` for the sync API, a folded state cache so each run only pulls
 the delta, and a rich-rendered CLI over the top.
 
@@ -18,7 +18,7 @@ things complete a1b2c3d4
 ## Install
 
 ```bash
-uv tool install "git+https://github.com/IsakRein/Projects.Things-Sync"
+uv tool install "git+https://github.com/IsakRein/Productivity.Things-Sync"
 ```
 
 For development:
